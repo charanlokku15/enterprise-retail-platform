@@ -1,0 +1,176 @@
+# ============================================================
+# Phase 1 — Infrastructure
+# Services: Postgres (x2), MinIO, Airflow (LocalExecutor)
+# DuckDB is NOT a service — it's an embedded file-based warehouse
+# that lives at ./warehouse/retail.duckdb and is accessed directly
+# by Python, dbt, and (later) Spark. Nothing to start for it here.
+# ============================================================
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.3-python3.11
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_PG_USER}:${AIRFLOW_PG_PASSWORD}@postgres-airflow/${AIRFLOW_PG_DB}
+    AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW__CORE__LOAD_EXAMPLES}
+    AIRFLOW__API__AUTH_BACKENDS: ${AIRFLOW__API__AUTH_BACKENDS}
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS}
+    OLTP_PG_HOST: postgres-oltp
+    OLTP_PG_USER: ${OLTP_PG_USER}
+    OLTP_PG_PASSWORD: ${OLTP_PG_PASSWORD}
+    OLTP_PG_DB: ${OLTP_PG_DB}
+    MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    DUCKDB_PATH: ${DUCKDB_PATH}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./warehouse:/warehouse
+    - ./data:/data
+    - ./spark:/spark
+    - ./great_expectations:/great_expectations
+  user: "${AIRFLOW_UID}:0"
+  depends_on:
+    postgres-airflow:
+      condition: service_healthy
+
+services:
+
+  # ---------------------------------------------------------
+  # Postgres #1 — Airflow's own metadata database
+  # ---------------------------------------------------------
+  postgres-airflow:
+    image: postgres:16
+    container_name: postgres-airflow
+    environment:
+      POSTGRES_USER: ${AIRFLOW_PG_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_PG_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_PG_DB}
+    volumes:
+      - airflow_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_PG_USER}"]
+      interval: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------
+  # Postgres #2 — simulated OLTP source (the retailer's app DB)
+  # ---------------------------------------------------------
+  postgres-oltp:
+    image: postgres:16
+    container_name: postgres-oltp
+    environment:
+      POSTGRES_USER: ${OLTP_PG_USER}
+      POSTGRES_PASSWORD: ${OLTP_PG_PASSWORD}
+      POSTGRES_DB: ${OLTP_PG_DB}
+    ports:
+      - "${OLTP_PG_PORT}:5432"
+    volumes:
+      - oltp_pg_data:/var/lib/postgresql/data
+      - ./scripts/init_oltp_schema.sql:/docker-entrypoint-initdb.d/init_oltp_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${OLTP_PG_USER}"]
+      interval: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------
+  # MinIO — S3-compatible object storage (raw/curated/archive)
+  # ---------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_API_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # One-shot job: creates the raw/processed/curated/archive buckets
+  # the moment MinIO is healthy, then exits.
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+      mc mb -p local/retail-platform/raw &&
+      mc mb -p local/retail-platform/processed &&
+      mc mb -p local/retail-platform/curated &&
+      mc mb -p local/retail-platform/archive &&
+      echo 'Buckets ready.'
+      "
+    restart: "no"
+
+  # ---------------------------------------------------------
+  # Airflow — one-time init (db migrate + create admin user)
+  # ---------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: >
+      /bin/bash -c "
+      airflow db migrate &&
+      airflow users create
+        --username ${AIRFLOW_ADMIN_USER}
+        --password ${AIRFLOW_ADMIN_PASSWORD}
+        --firstname ${AIRFLOW_ADMIN_FIRSTNAME}
+        --lastname ${AIRFLOW_ADMIN_LASTNAME}
+        --role Admin
+        --email ${AIRFLOW_ADMIN_EMAIL} || true
+      "
+    restart: "no"
+
+  # ---------------------------------------------------------
+  # Airflow — webserver
+  # ---------------------------------------------------------
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------
+  # Airflow — scheduler
+  # ---------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  airflow_pg_data:
+  oltp_pg_data:
+  minio_data:

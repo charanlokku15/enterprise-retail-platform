@@ -1,0 +1,40 @@
+# Environments / secrets
+.env
+*.env.local
+
+# Airflow runtime
+airflow/logs/*
+!airflow/logs/.gitkeep
+airflow/plugins/__pycache__/
+
+# DuckDB warehouse file (generated, not source-controlled)
+warehouse/*.duckdb
+warehouse/*.duckdb.wal
+
+# MinIO local data volume (bind-mounted, not source-controlled)
+minio_data/
+
+# Generated datasets
+data/generated/*
+data/raw/*
+!data/generated/.gitkeep
+!data/raw/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+
+# Great Expectations
+great_expectations/uncommitted/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
